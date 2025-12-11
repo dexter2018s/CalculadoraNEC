@@ -22,15 +22,30 @@ st.markdown("""
 <style>
     .reportview-container { background: #f0f2f6; }
     .main-header { font-family: 'Inter', sans-serif; color: #1E3A8A; font-weight: 700; }
-    .metric-card { background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; }
-    .stButton>button { width: 100%; border-radius: 8px; font-weight: 600; }
     .stDataFrame { border-radius: 10px; overflow: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
 # --- Session State Init ---
-if 'loads' not in st.session_state:
-    st.session_state.loads = []
+INPUT_COLUMNS = [
+    "Nombre", "Qty", "Potencia", "Unidad", "Voltaje", "Fases", "FP", 
+    "Longitud", "U.Long", "EsMotor", "EsContinuo", 
+    "T.Amb", "Ducto", "Rating", "Agrupamiento", "CalculatedAmpsOverride"
+]
+
+if 'loads_df' not in st.session_state:
+    st.session_state.loads_df = pd.DataFrame(columns=INPUT_COLUMNS)
+else:
+    # Sanitation Check: Ensure no duplicate columns from previous hot-reloads
+    st.session_state.loads_df = st.session_state.loads_df.loc[:, ~st.session_state.loads_df.columns.duplicated()]
+    # Ensure only input columns exist
+    existing_cols = [c for c in INPUT_COLUMNS if c in st.session_state.loads_df.columns]
+    st.session_state.loads_df = st.session_state.loads_df[existing_cols]
+    
+    # Missing columns fill?
+    for col in INPUT_COLUMNS:
+        if col not in st.session_state.loads_df.columns:
+            st.session_state.loads_df[col] = None
 
 if "voltage_input" not in st.session_state:
     st.session_state.voltage_input = 480.0
@@ -41,18 +56,106 @@ def on_phase_change():
     else:
         st.session_state.voltage_input = 480.0
 
-# --- Sidebar: Global Settings ---
+# --- Helper: Calculate Row ---
+def calculate_row_results(row):
+    # Convert Row to Objects
+    try:
+        # Power Unit Logic is complex because we need original val and unit.
+        # But we stored them. Recalculate watts.
+        # Wait, if user edits "Potencia" in table (e.g. 10 -> 15), we need to recalibrate.
+        
+        watts, amps_ovr = convert_power_unit(
+            float(row["Potencia"]), row["Unidad"], 
+            float(row["Voltaje"]), int(row["Fases"]), float(row["FP"])
+        )
+        
+        len_m = convert_length_unit(float(row["Longitud"]), row["U.Long"])
+        
+        # Conduit Map
+        c_str = str(row["Ducto"])
+        c_type = ConduitType.PVC
+        if "Acero" in c_str or "STEEL" in c_str.upper(): c_type = ConduitType.STEEL
+        elif "Alum" in c_str or "ALUMINUM" in c_str.upper(): c_type = ConduitType.ALUMINUM
+            
+        # Insul Map
+        r_val = int(str(row["Rating"]).replace("C","").replace("°",""))
+        r_enum = InsulationRating.TEMP_90 if r_val == 90 else InsulationRating.TEMP_75
+        
+        load_obj = LoadInput(
+            name=str(row["Nombre"]),
+            power_watts=watts,
+            voltage=float(row["Voltaje"]),
+            phases=int(row["Fases"]),
+            is_continuous=bool(row["EsContinuo"]),
+            is_motor=bool(row["EsMotor"]),
+            power_factor=float(row["FP"]),
+            quantity=int(row["Qty"]),
+            override_amps=amps_ovr
+        )
+        
+        inst_params = InstallationParams(
+            length_meters=len_m,
+            conduit_type=c_type,
+            ambient_temp_c=float(row["T.Amb"]),
+            raceway_count=int(row["Agrupamiento"]),
+            conductor_material=ConductorMaterial.COPPER,
+            insulation_rating=r_enum
+        )
+        
+        res = NECLogic.select_conductor_and_breaker(load_obj, inst_params)
+        
+        # Display Amps
+        if amps_ovr:
+            d_amps = amps_ovr
+        else:
+             if load_obj.phases == 1:
+                d_amps = load_obj.power_watts / (load_obj.voltage * load_obj.power_factor)
+             else:
+                d_amps = load_obj.power_watts / (math.sqrt(3) * load_obj.voltage * load_obj.power_factor)
+
+        return pd.Series({
+            "I (Amps)": round(d_amps, 1),
+            "Calibre": res.size,
+            "Ampacidad": res.ampacity,
+            "Breaker": res.breaker_rating,
+            "% VD": float(f"{res.voltage_drop_percent:.2f}"),
+            "Notas": res.reference_notes,
+            "_load_obj": load_obj # Store for feeder calc (hidden)
+        })
+    except Exception as e:
+        return pd.Series({"Notas": f"Error: {str(e)}"})
+
+# --- Helper: Export Excel ---
+def to_excel(df, feeder_data=None):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Sheet 1: Detail
+        cols_to_export = [c for c in df.columns if c != "_load_obj" and c != "CalculatedAmpsOverride"]
+        df[cols_to_export].to_excel(writer, index=False, sheet_name='Circuitos')
+        
+        # Sheet 2: Feeder
+        if feeder_data:
+            f_df = pd.DataFrame([
+                {"Parametro": "Total Amps Estimado", "Valor": feeder_data['total_amps']},
+                {"Parametro": "Conductor Alimentador Sugerido", "Valor": feeder_data['cable_size']},
+                {"Parametro": "Configuración", "Valor": feeder_data['description']},
+                {"Parametro": "Runs Paralelos", "Valor": feeder_data['parallel_runs']}
+            ])
+            f_df.to_excel(writer, index=False, sheet_name='Alimentador')
+            
+    return output.getvalue()
+
+# --- Sidebar ---
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/2933/2933886.png", width=60)
-    st.title("Configuración Global")
-    st.info("💡 Pase el mouse sobre el icono (?) junto a los campos para ver referencias a las tablas NEC.")
+    st.title("Configuración")
+    st.info("Ahora puede editar todos los datos directamente en la tabla principal.")
     
     st.markdown("---")
     st.subheader("📥 Importación Masiva")
     
     # 1. Download Template
     def get_template():
-        # Create a sample DataFrame
         data = {
             "Nombre": ["Motor Bomba", "Iluminación Hall"],
             "Cantidad": [1, 15],
@@ -67,6 +170,7 @@ with st.sidebar:
             "EsContinuo": ["NO", "SI"],
             "TempAmb": [30, 30],
             "TipoDucto": ["ACERO", "PVC"],
+            "Rating": [75, 90],
             "Agrupamiento": [3, 3]
         }
         df = pd.DataFrame(data)
@@ -80,270 +184,229 @@ with st.sidebar:
         data=get_template(),
         file_name="plantilla_cargas_nec.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        help="Descargue esta plantilla, llénela con sus cargas y súbala abajo."
+        help="Descargue esta plantilla, llénela y súbala."
     )
     
     # 2. Upload File
-    uploaded_file = st.file_uploader("Subir Excel", type=["xlsx"], help="Asegúrese de respetar los nombres de columnas de la plantilla.")
+    uploaded_file = st.file_uploader("Subir Excel", type=["xlsx"])
     
     if uploaded_file:
         if st.button("Procesar Archivo"):
             try:
                 df_in = pd.read_excel(uploaded_file)
-                success_count = 0
-                errors = []
+                new_rows = []
                 
                 for idx, row in df_in.iterrows():
+                    # Map Excel columns to App DataFrame Columns
+                    # Flexible reading
                     try:
-                        # Parsing
-                        p_unit = str(row.get("UnidadPotencia", "W")).strip()
-                        l_unit = str(row.get("UnidadLongitud", "m")).strip()
-                        watts, amps_override = convert_power_unit(float(row["Potencia"]), p_unit, float(row["Voltaje"]), int(row["Fases"]), float(row["FP"]))
-                        len_m = convert_length_unit(float(row["Longitud"]), l_unit)
-                        
-                        # Booleans
-                        is_mot = str(row.get("EsMotor", "NO")).strip().upper() == "SI"
-                        is_cont = str(row.get("EsContinuo", "NO")).strip().upper() == "SI"
-                        
-                        # Conduit
-                        c_str = str(row.get("TipoDucto", "PVC")).strip().upper()
-                        c_type = ConduitType.STEEL if "ACERO" in c_str or "STEEL" in c_str else (ConduitType.ALUMINUM if "ALUM" in c_str else ConduitType.PVC)
-                        
-                        load_obj = LoadInput(
-                            name=str(row["Nombre"]), 
-                            power_watts=watts, 
-                            voltage=float(row["Voltaje"]), 
-                            phases=int(row["Fases"]),
-                            is_continuous=is_cont, 
-                            is_motor=is_mot, 
-                            power_factor=float(row["FP"]), 
-                            quantity=int(row.get("Cantidad", 1)), 
-                            override_amps=amps_override
-                        )
-                        
-                        inst_params = InstallationParams(
-                            length_meters=len_m,
-                            conduit_type=c_type,
-                            ambient_temp_c=float(row.get("TempAmb", 30)),
-                            raceway_count=int(row.get("Agrupamiento", 3)),
-                            conductor_material=ConductorMaterial.COPPER,
-                            insulation_rating=InsulationRating.TEMP_75 # Default import as 75 for safety, or add col
-                        )
-                        
-                        st.session_state.loads.append({"load": load_obj, "params": inst_params})
-                        success_count += 1
-                        
+                        n_row = {
+                            "Nombre": str(row.get("Nombre", "Carga")),
+                            "Qty": int(row.get("Cantidad", 1)),
+                            "Potencia": float(row.get("Potencia", 0)),
+                            "Unidad": str(row.get("UnidadPotencia", "W")).strip(),
+                            "Voltaje": float(row.get("Voltaje", 220)),
+                            "Fases": int(row.get("Fases", 1)),
+                            "FP": float(row.get("FP", 0.9)),
+                            "Longitud": float(row.get("Longitud", 10)),
+                            "U.Long": str(row.get("UnidadLongitud", "m")).strip(),
+                            "EsMotor": str(row.get("EsMotor", "NO")).upper() == "SI",
+                            "EsContinuo": str(row.get("EsContinuo", "NO")).upper() == "SI",
+                            "T.Amb": float(row.get("TempAmb", 30)),
+                            "Ducto": "Acero" if "ACERO" in str(row.get("TipoDucto", "")).upper() or "STEEL" in str(row.get("TipoDucto", "")).upper() else ("Aluminio" if "ALUM" in str(row.get("TipoDucto", "")).upper() else "PVC"),
+                            "Rating": int(row.get("Rating", 75)),
+                            "Agrupamiento": int(row.get("Agrupamiento", 3)),
+                            "CalculatedAmpsOverride": None
+                        }
+                        new_rows.append(n_row)
                     except Exception as e:
-                        errors.append(f"Fila {idx+2}: {str(e)}")
+                        st.error(f"Error parseando fila {idx+2}: {e}")
                 
-                if success_count > 0:
-                    st.success(f"✅ {success_count} cargas importadas.")
-                    if errors:
-                        st.warning(f"⚠️ {len(errors)} errores: {'; '.join(errors)}")
+                if new_rows:
+                    new_df = pd.DataFrame(new_rows)
+                    # Align columns just in case
+                    st.session_state.loads_df = pd.concat([st.session_state.loads_df, new_df], ignore_index=True)
+                    st.success(f"✅ {len(new_rows)} cargas importadas.")
                     st.rerun()
-                else:
-                    st.error("No se pudieron importar cargas. Revise el formato.")
                     
             except Exception as e:
-                st.error(f"Error leyendo archivo: {e}")
-
+                st.error(f"Error procesando archivo: {e}")
+        
 # --- Main Area ---
-st.markdown("<h1 class='main-header'>⚡ Calculadora de Circuitos (NEC Edition v2.2)</h1>", unsafe_allow_html=True)
+st.markdown("<h1 class='main-header'>⚡ Calculadora de Circuitos (NEC Edition v2.3)</h1>", unsafe_allow_html=True)
 st.markdown("---")
 
-col1, col2 = st.columns([1, 2])
+# Input Form (Clean Layout)
+with st.expander("➕ Agregar Nueva Carga", expanded=True):
+    # Row 1: Identificación
+    c_name, c_qty = st.columns([3, 1])
+    name = c_name.text_input("Nombre de la Carga", "Carga 1")
+    qty = c_qty.number_input("Cantidad", 1, 100, 1, help="Multiplicador")
 
-# --- Section 1: Add New Load ---
-with col1:
-    with st.container():
-        st.subheader("➕ Agregar Carga Manual")
-        
-        name = st.text_input("Nombre de Carga", placeholder="Ej. Motor Bomba 1")
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            qty = st.number_input("Cantidad", min_value=1, value=1, step=1, help="Multiplicador para cargas idénticas.")
-        with c2:
-            phases = st.radio("Fases", [1, 3], horizontal=True, key="phases_input", on_change=on_phase_change)
-        
-        c3, c4 = st.columns([2, 1])
-        with c3:
-            power_val = st.number_input("Potencia", min_value=0.0, value=0.0, step=0.1)
-        with c4:
-            power_unit = st.selectbox("Unidad", ["W", "KW", "HP", "A", "KVA"], help="HP: Se convierte a Watts (x746). KVA: Se aplica Factor de Potencia.")
-            
-        voltage = st.number_input("Voltaje (V)", step=10.0, key="voltage_input")
-        
-        pf = st.number_input("Factor de Potencia", value=0.9, min_value=0.1, max_value=1.0, step=0.05, help="Afecta el cálculo de corriente en AC y la impedancia efectiva (Z) para caída de tensión.")
-        
-        st.markdown("**Detalles del Circuito Derivado**")
-        length_val = st.number_input("Longitud", value=10.0, help="Distancia unidireccional. Usado para Caída de Tensión.")
-        length_unit = st.selectbox("Unidad Long.", ["m", "ft"], index=0)
-        
-        with st.expander("Opciones Avanzadas (NEC) - Ambiente y Ducto", expanded=True):
-            is_motor = st.checkbox("Es Motor", value=False, help="Aplica reglas de NEC 430.22 (125% FLA).")
-            is_continuous = st.checkbox("Carga Continua (>3h)", value=False, help="NEC 215.2(A)(1): Requiere 125% de capacidad.")
-            
-            st.markdown("---")
-            st.markdown("**Condiciones de Instalación**")
-            
-            temp_c = st.number_input("Temperatura Ambiente (°C)", value=30.0, step=1.0, min_value=-50.0, max_value=120.0, 
-                                     help="NEC Tabla 310.15(B)(1): Corrección por temperatura.")
-            
-            conduit_options = {
-                "PVC (No Magnético)": ConduitType.PVC,
-                "Acero (Magnético)": ConduitType.STEEL,
-                "Aluminio": ConduitType.ALUMINUM
-            }
-            conduit_label = st.selectbox("Tipo de Ducto", list(conduit_options.keys()), 
-                                         help="NEC Table 9: Material afecta reactancia (X).")
-            local_conduit = conduit_options[conduit_label]
-            
-            temp_rating_choice = st.radio("Temp. Aislamiento", ["75°C (THWN)", "90°C (THHN/THWN-2)"], 
-                                          help="NEC 310.16 / 110.14(C): Ampacidad base.")
-            rating_enum = InsulationRating.TEMP_90 if "90" in temp_rating_choice else InsulationRating.TEMP_75
-            
-            grouping_count = st.number_input("Total Conductores en Ducto", min_value=1, value=3, 
-                                             help="NEC Tabla 310.15(C)(1): Factor de agrupamiento.")
-        
-        if st.button("Agregar Carga", type="primary"):
-            if name:
-                watts, amps_override = convert_power_unit(power_val, power_unit, voltage, phases, pf)
-                length_m = convert_length_unit(length_val, length_unit)
-                
-                load_obj = LoadInput(
-                    name=name, power_watts=watts, voltage=voltage, phases=phases,
-                    is_continuous=is_continuous, is_motor=is_motor, power_factor=pf,
-                    quantity=qty, override_amps=amps_override
-                )
-                
-                inst_params = InstallationParams(
-                    length_meters=length_m,
-                    conduit_type=local_conduit,
-                    ambient_temp_c=temp_c,
-                    raceway_count=grouping_count,
-                    conductor_material=ConductorMaterial.COPPER,
-                    insulation_rating=rating_enum
-                )
-                
-                st.session_state.loads.append({"load": load_obj, "params": inst_params})
-                st.success(f"Carga '{name}' agregada.")
-            else:
-                st.error("El nombre es obligatorio.")
-
-# --- Section 2: Results Table ---
-with col2:
-    st.subheader("📋 Tabla de Cargas y Resultados")
+    st.markdown("##### ⚡ Datos Eléctricos")
+    # Row 2: Potencia Compleja y Voltaje
+    c_p1, c_p2, c_v1, c_v2, c_fp = st.columns([1.5, 0.8, 1.2, 0.8, 1])
+    power = c_p1.number_input("Potencia", 0.0, step=0.1, format="%.2f")
+    unit = c_p2.selectbox("Unidad", ["W", "KW", "HP", "A", "KVA"], label_visibility="visible")
     
-    if not st.session_state.loads:
-        st.info("No hay cargas agregadas. Utilice el formulario de la izquierda o importe desde Excel en el menú lateral.")
-    else:
-        results_data = []
-        feeder_loads = []
-        
-        for i, item in enumerate(st.session_state.loads):
-            l = item["load"]
-            p = item["params"]
-            
-            res = NECLogic.select_conductor_and_breaker(l, p)
-            
-            if l.override_amps:
-                disp_amps = l.override_amps
-            else:
-                 if l.phases == 1:
-                    disp_amps = l.power_watts / (l.voltage * l.power_factor)
-                 else:
-                    disp_amps = l.power_watts / (math.sqrt(3) * l.voltage * l.power_factor)
-            
-            c_disp = "PVC"
-            if p.conduit_type == ConduitType.STEEL: c_disp = "Acero"
-            elif p.conduit_type == ConduitType.ALUMINUM: c_disp = "Alum"
+    voltage = c_v1.number_input("Voltaje (V)", step=10, key="voltage_input")
+    phases = c_v2.radio("Fases", [1, 3], horizontal=True, key="phases_input", on_change=on_phase_change)
+    pf = c_fp.number_input("FP", 0.1, 1.0, 0.9, 0.05)
 
-            results_data.append({
-                "Cant": l.quantity,
-                "Nombre": l.name,
-                "Amps": round(disp_amps, 1),
-                "Calibre": res.size,
-                "Ampacidad": res.ampacity,
-                "Breaker": res.breaker_rating,
-                "% VD": float(f"{res.voltage_drop_percent:.2f}"),
-                "T.Amb": f"{p.ambient_temp_c}°C",
-                "Ducto": c_disp,
-                "Rating": f"{p.insulation_rating.value}C"
-            })
-            
-            feeder_loads.append(l)
+    # Row 3: Flags
+    c_flags = st.columns(4)
+    is_motor = c_flags[0].toggle("Es Motor", False)
+    is_cont = c_flags[1].toggle("Carga Continua", False)
 
-        df = pd.DataFrame(results_data)
-        
-        st.dataframe(
-            df.style.map(lambda x: 'color: red; font-weight: bold' if isinstance(x, float) and x > 3.0 else '', subset=['% VD']),
-            use_container_width=True,
-            hide_index=True
+    st.markdown("##### 📏 Instalación y Ambiente")
+    # Row 4: Física
+    c_L1, c_L2, c_T1, c_T2 = st.columns([1.5, 0.8, 1.2, 1])
+    length = c_L1.number_input("Longitud", 1.0, step=1.0)
+    l_unit = c_L2.selectbox("U.Long", ["m", "ft"])
+    temp = c_T1.number_input("Temp. Amb (°C)", value=30.0, step=1.0)
+    rating = c_T2.selectbox("Aislamiento", ["75", "90"])
+
+    # Row 5: Ducto
+    c_D1, c_D2 = st.columns([2, 1])
+    duct = c_D1.selectbox("Tipo de Ducto", ["PVC", "Acero", "Aluminio"])
+    group = c_D2.number_input("Agrupamiento (Cables en ducto)", 1, 40, 3)
+
+    st.write("") # Spacer
+    if st.button("Agregar a Tabla", type="primary", use_container_width=True):
+        new_row = {
+            "Nombre": name, "Qty": qty, "Potencia": power, "Unidad": unit, 
+            "Voltaje": voltage, "Fases": phases, "FP": pf,
+            "Longitud": length, "U.Long": l_unit, 
+            "EsMotor": is_motor, "EsContinuo": is_cont,
+            "T.Amb": temp, "Ducto": duct, "Rating": int(rating), "Agrupamiento": group,
+            "CalculatedAmpsOverride": None
+        }
+        st.session_state.loads_df = pd.concat([st.session_state.loads_df, pd.DataFrame([new_row])], ignore_index=True)
+        st.rerun()
+
+st.markdown("### 📋 Tabla Maestra de Cargas (Editable)")
+
+# Toolbar
+tb1, tb2, tb3 = st.columns([1, 1, 4])
+with tb1:
+    if st.button("🗑️ Borrar Tabla", type="secondary", use_container_width=True):
+        st.session_state.loads_df = pd.DataFrame(columns=INPUT_COLUMNS)
+        st.rerun()
+with tb2:
+    # Prepare export data eagerly for the button logic
+    # Note: To export fully calculated data, we need the df_full from below. 
+    # But streamlining, we can recalculate or wait.
+    # Actually, we can just use the button below or duplicate logic.
+    # To avoid double calc, we will render this button AFTER calc but using columns container trick or just place it below header.
+    # Since download_button needs data content immediately, let's defer rendering until we have df_full.
+    pass
+
+st.caption("Edite cualquier celda para recalcular. Seleccione filas y presione 'Supr'/Delete para eliminar.")
+
+# Prepare Data for Editor
+df_to_show = st.session_state.loads_df.copy()
+
+# Apply Calculations
+if not df_to_show.empty:
+    results = df_to_show.apply(calculate_row_results, axis=1)
+    df_full = pd.concat([df_to_show, results], axis=1)
+else:
+    result_cols = ["I (Amps)", "Calibre", "Ampacidad", "Breaker", "% VD", "Notas", "_load_obj"]
+    df_results_empty = pd.DataFrame(columns=result_cols)
+    df_full = pd.concat([df_to_show, df_results_empty], axis=1)
+
+# Toolbar Part 2 (Now we have data)
+with tb2:
+     if not df_full.empty:
+        st.download_button(
+            "📥 Excel",
+            data=to_excel(df_full), # Simplified call, Feeder calc is later, maybe pass None or quick calc?
+            # User wants to download TABLE. Maybe just table? 
+            # Or wait... st.download_button reruns script? No.
+            file_name="tabla_cargas.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
         )
-        
-        if st.button("🗑️ Limpiar Todo", type="secondary"):
-            st.session_state.loads = []
-            st.rerun()
 
-# --- Section 3: Main Feeder ---
+# Configure Columns
+column_config = {
+    "Qty": st.column_config.NumberColumn("Cant", min_value=1, step=1, width="small"),
+    "Potencia": st.column_config.NumberColumn(min_value=0, step=0.1, format="%.1f"),
+    "Unidad": st.column_config.SelectboxColumn(options=["W", "KW", "HP", "A", "KVA"], width="small"),
+    "Voltaje": st.column_config.NumberColumn(step=10),
+    "Fases": st.column_config.SelectboxColumn(options=[1, 3], width="small"),
+    "Ducto": st.column_config.SelectboxColumn(options=["PVC", "Acero", "Aluminio"], width="medium"),
+    "Rating": st.column_config.SelectboxColumn(options=[75, 90], width="small"),
+    "U.Long": st.column_config.SelectboxColumn(options=["m", "ft"], width="small"),
+    "_load_obj": None, # Hide
+    "CalculatedAmpsOverride": None # Hide
+}
+
+# Output columns should be disabled
+disabled_cols = ["I (Amps)", "Calibre", "Ampacidad", "Breaker", "% VD", "Notas"]
+
+edited_df = st.data_editor(
+    df_full,
+    key="editor",
+    use_container_width=True,
+    num_rows="dynamic",
+    column_config=column_config,
+    disabled=disabled_cols,
+    height=400
+)
+
+# Detect Changes
+# Logic: If edited_df differs from st.session_state.loads_df (ignoring result cols), update session state
+# Filter input columns only
+edited_inputs = edited_df[INPUT_COLUMNS]
+
+# We verify if we need to update session state (if inputs changed)
+if not edited_inputs.equals(st.session_state.loads_df):
+    st.session_state.loads_df = edited_inputs
+    st.rerun() # Rerun to recalculate results if needed
+
+# --- Feeder Section ---
 st.markdown("---")
-st.subheader("🏢 Alimentador Principal (Main Feeder)")
+st.subheader("🏢 Alimentador Total")
 
-if st.session_state.loads:
-    feeder_res = NECLogic.calculate_main_feeder(feeder_loads)
-    
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.metric("Corriente Total Est.", f"{feeder_res['total_amps']:.1f} A", help="Suma de cargas según NEC 430.24 (Motores) y 215.2 (F. Demanda).")
-    with m2:
-        st.metric("Conductor Sugerido", feeder_res['cable_size'], help="Seleccionado de NEC Tabla 310.16 (75°C).")
-    with m3:
-        runs = feeder_res['parallel_runs']
-        desc = feeder_res['description']
-        st.metric("Configuración", "Simple" if runs==1 else f"{runs}x Paralelo", delta=desc, delta_color="off", help="Configuración paralela si Corriente > 400A (NEC 310.10(H)).")
-    
-    st.info(f"**Nota:** Cálculo basado en NEC 430.24 (Motores) y 215.2 (Continuo + Demand). {feeder_res['description']}")
+# Extract Load Objects from 'df_full'
+feeder_loads_list = []
+if "_load_obj" in df_full.columns:
+    feeder_loads_list = df_full["_load_obj"].dropna().tolist()
 
-# --- Section 4: Export ---
-def generate_excel():
+if feeder_loads_list:
+    feeder_res = NECLogic.calculate_main_feeder(feeder_loads_list)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Amps", f"{feeder_res['total_amps']:.1f} A")
+    c2.metric("Cable Feeder", feeder_res['cable_size'])
+    c3.metric("Config", feeder_res['description'])
+
+# --- Export Selection ---
+def to_excel(df, feeder_data):
     output = io.BytesIO()
-    wb = Workbook()
-    
-    # Sheet 1: Branch Circuits
-    ws = wb.active
-    ws.title = "Circuitos Derivados"
-    ws.append(["Cant", "Nombre", "Potencia W", "Voltaje", "Fases", "Amps", "Calibre", "Ampacidad", "Breaker", "% VD", "T.Amb", "Tipo Ducto", "Insul.", "Notas"])
-    
-    for i, item in enumerate(st.session_state.loads):
-        l = item["load"]
-        p = item["params"]
-        r = NECLogic.select_conductor_and_breaker(l, p)
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Sheet 1: Detail
+        cols_to_export = [c for c in df.columns if c != "_load_obj" and c != "CalculatedAmpsOverride"]
+        df[cols_to_export].to_excel(writer, index=False, sheet_name='Circuitos')
         
-        if l.override_amps:
-            a = l.override_amps
-        else:
-             a = l.power_watts / (l.voltage * (1.732 if l.phases==3 else 1) * l.power_factor)
-             
-        ws.append([l.quantity, l.name, l.power_watts, l.voltage, l.phases, round(a,2), r.size, r.ampacity, r.breaker_rating, r.voltage_drop_percent, p.ambient_temp_c, p.conduit_type.value, p.insulation_rating.value, r.reference_notes])
-
-    # Sheet 2: Feeder
-    if st.session_state.loads:
-        ws2 = wb.create_sheet("Alimentador")
-        fres = NECLogic.calculate_main_feeder([item["load"] for item in st.session_state.loads])
-        ws2.append(["Parametro", "Valor"])
-        ws2.append(["Total Amps", fres['total_amps']])
-        ws2.append(["Cable", fres['cable_size']])
-        ws2.append(["Config", fres['description']])
-
-    wb.save(output)
+        # Sheet 2: Feeder
+        if feeder_data:
+            f_df = pd.DataFrame([
+                {"Parametro": "Total Amps Estimado", "Valor": feeder_data['total_amps']},
+                {"Parametro": "Conductor Alimentador Sugerido", "Valor": feeder_data['cable_size']},
+                {"Parametro": "Configuración", "Valor": feeder_data['description']},
+                {"Parametro": "Runs Paralelos", "Valor": feeder_data['parallel_runs']}
+            ])
+            f_df.to_excel(writer, index=False, sheet_name='Alimentador')
+            
     return output.getvalue()
 
-if st.session_state.loads:
-    excel_data = generate_excel()
+if not df_full.empty:
+    excel_data = to_excel(df_full, feeder_res if 'feeder_res' in locals() else None)
     st.download_button(
-        label="📥 Descargar Reporte Excel",
+        "📥 Descargar Resultados (Excel)",
         data=excel_data,
-        file_name="memoria_calculo_nec_v2.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        file_name="memoria_nec_v2_3.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Descarga la tabla completa y el cálculo del alimentador."
     )
